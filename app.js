@@ -10,30 +10,20 @@ const request = require('request')
 
 
 //================
-
-const namespaces = ['application', 'fakeyou']
+//测试完毕这里改成300
+const syncInterval = 30
+const namespaces = ['adapterCaps', 'configs', 'renderConfig']
 const os = require('os')
+const metaUrl = 'http://10.100.10.48:8080'
+const appId = 'CloudRendererAgent'
 const localIp = getIPAdress()
-const metaUrl = 'http://127.0.0.1:8080'
-const appId = 'test'
 configServices = []
-
 //apolloconfig 缓存
 var apolloConfigs = {}
-
 var notifications = []
-
 var remoteNotificationMessages = {}
-// var remoteNotificationMessages = new Map()
-
-
-
-class ApolloNotificationMessage {
-  constructor(details){
-        this.details = details
-    }
-}
-
+var timeout = 1
+var maxTimeout = 120
 class ApolloConfig{
   constructor(appId, cluster, namepaceName, configurations, releaseKey){
       this.appId = appId
@@ -41,6 +31,13 @@ class ApolloConfig{
       this.namepaceName = namepaceName
       this.configurations = configurations
       this.releaseKey = releaseKey
+    }
+}
+
+class ApolloError {
+  constructor(url, cause){
+      this.url = url
+      this.cause = cause
     }
 }
 
@@ -64,7 +61,7 @@ function getIPAdress() {
 //获取configServices
 function getConfigServices() {
     return new Promise((resolve, reject) =>{
-        let url = metaUrl + '/services/config?appId=' + appId + '&ip=' + localIp
+        let url = metaUrl + '/services/config?appId=' + appId
         request(url,function(error,response,body){
             if(!error && response.statusCode == 200){
                 let configServices = []
@@ -72,15 +69,21 @@ function getConfigServices() {
                 for(var  i = 0; i<results.length; i++) {
                   configServices.push(results[i].homepageUrl)
                 }
-                resolve(configServices)
+                if(Object.keys(configServices).length == 0) {
+                  apolloError = new ApolloError(url, '获取configServices失败，没有可用configServices')
+                  reject(apolloError)
+                }
+                else {
+                    resolve(configServices)
+                }
             }
+
             else {
-              reject('ApolloError: 获取configServices失败')
+              apolloError = new ApolloError(url, '获取configServices失败,连接失败')
+              reject(apolloError)
             }
         })
-
     })
-    
 }
 
 
@@ -88,10 +91,9 @@ function doLongPollingRequest(url) {
   return new Promise((resolve, reject) =>{
     request(url,function(error,response,body){
         if (error) {
-            reject(new Error('ApolloError: doLongPollingRequest无法连上apollo服务器'))
+            apolloError = new ApolloError(url, '推机制连接失败')
+            reject(apolloError)
         }
-          //console.log('long polling url ' + url)
-        //console.log('long polling response ' + body + ' response code ' + response.statusCode)
         if(!error && response.statusCode == 200){
             let result = JSON.parse(body)
             //通知poll方法
@@ -115,7 +117,8 @@ function doLongPollingRequest(url) {
             resolve()
         }
         else {
-            reject(new Error('ApolloError: doLongPollingRequest错误'))
+            apolloError = new ApolloError(url, '推机制返回错误')
+            reject(apolloError)
         }
         
     })
@@ -124,29 +127,59 @@ function doLongPollingRequest(url) {
 
 //http://10.100.10.52:18080//notifications/v2?cluster=default&appId=test&ip=10.2.10.38&notifications=%5B%7B%22namespaceName%22%3A%22application%22%2C%22notificationId%22%3A-1%7D%5D
 //http://10.100.10.52:18080//notifications/v2?cluster=default&appId=test&ip=10.2.10.38&notifications=%5B%7B%22namespaceName%22%3A%22application%22%2C%22notificationId%22%3A96%7D%5D
-
 async function longPolling() {
-   return  new  Promise(async (resolve, reject) =>  {
-    for(var i = 0; i < configServices.length; i++) {
-      let url = configServices[i] + '/notifications/v2?cluster=default&appId=' + appId + '&ip=' + localIp + '&notifications=' + querystring.escape(JSON.stringify(notifications))
-
-
-      try {
-          let notificationMessage = await doLongPollingRequest(url).catch(err => {console.log(err.message); throw err})
+   return new Promise(async (resolve, reject) =>  {
+    setTimeout(async ()=> {
+      for(var i = 0; i < configServices.length; i++) {
+      //let url = configServices[i] + '/notifications/v2?cluster=default&appId=' + appId + '&ip=' + localIp + '&notifications=' + querystring.escape(JSON.stringify(notifications))
+        let url = configServices[i] + '/notifications/v2?cluster=default&appId=' + appId + '&ip=' + localIp +  '&notifications=' + querystring.escape(JSON.stringify(notifications))
+        try {
+          let notificationMessage = await doLongPollingRequest(url).catch(err => {throw err})
+          
           resolve(notificationMessage)
+          //故障若恢复，等待步长重置
+          timeout = 1
           break
-      }
-      catch(err) {
-        if(i == configServices.length -1) {
-            reject(err) 
         }
-        else {
-            console.err('ApolloError: longPolling失败，' + err.message + ' 开始下一次longPolling')
-            continue
+        catch(err) {
+          if(i == configServices.length -1) {
+              //避免由于apollo发生故障，无限轮询，解决方案
+              //1、漏斗算法，固定时间窗口只能acquire 固定次数
+              //2、每次发生问题，等待时间进行指数级增长
+              //这里设计相对简单，等待时间增长n次
+              timeout = (timeout << 1) < maxTimeout ? timeout << 1 : maxTimeout
+              reject(err) 
+          }
+          else {
+              console.error('ApolloError: longPolling失败, 由于有多个configService, 开始下一次longPolling')
+              continue
+          }
+        }
+      }
+    }, timeout * 1000)
+
+
+    
+  })
+}
+
+async function  loopLongPolling() {
+  for(;;) {
+    let notificationMessages = await longPolling().catch(error => {
+        console.error('Long polling failed, will retry in ' + timeout + ' seconds. appId: ' + appId + ' url: '+ error.url + ' cause(' + error.cause + ')')
+    })
+    if(notificationMessages != undefined && Object.keys(notificationMessages).length > 0) {
+      console.log('推机制返回200，触发拉机制')
+      let newApolloConfigs = await submitPolling(notificationMessages).catch(error => console.error(error))
+      if(newApolloConfigs != undefined && Object.keys(newApolloConfigs).length != 0) {
+        
+        for(namespace in newApolloConfigs) {
+          apolloConfigs[namespace] = newApolloConfigs[namespace]
+          console.log('namespace: ' + namespace + '，configurations: ' + JSON.stringify(apolloConfigs[namespace].configurations))
         }
       }
     }
-  })
+  }
 }
 
 
@@ -154,7 +187,8 @@ function doPollingRequest(namespace, url) {
     return new Promise((resolve, reject) =>{
         request(url,function(error,response,body){
           if(error) {
-            reject(new Error('ApolloError: pollingDoRequest无法连上apollo服务器'))
+            apolloError = new ApolloError(url, '拉机制连接失败')
+            reject(apolloError)
           }
           if(!error && response.statusCode == 200){
               let result = JSON.parse(body)
@@ -164,14 +198,14 @@ function doPollingRequest(namespace, url) {
               let configurations = result.configurations
               let releaseKey = result.releaseKey
               let newApolloConfig = new ApolloConfig(appId, cluster, namespaceName, configurations, releaseKey)
-              console.log('namespace: '+ namespace + ' ;configurations: ' + JSON.stringify(newApolloConfig.configurations))
               resolve(newApolloConfig)
           }
           if(!error && response.statusCode == 304) {
               resolve()
           }
           else {
-              reject(new Error('ApolloError: doLongPollingRequest错误'))
+              apolloError = new ApolloError(url, '拉机制返回错误')
+              reject(apolloError)
           }
         })
     })
@@ -193,22 +227,20 @@ async function submitPolling(notificationMessages){
           for(var j = 0; j < configServices.length; j++) {
               
               let url = configServices[j] + '/configs/' + appId + '/default/' + namespace + '?ip=' + localIp
-              url = url + "&messages=" + querystring.escape(JSON.stringify(details))
+              url = url + "messages=" + querystring.escape(JSON.stringify(details))
               if(apolloConfigs[namespace] != undefined) {
                   url = url + "&releaseKey=" + apolloConfigs[namespace].releaseKey
               }
-
               try {
-                  newApolloConfig = await doPollingRequest(namespace, url).catch(err => {console.log(err.message); throw err})
+                  newApolloConfig = await doPollingRequest(namespace, url).catch(err => {throw err})
                   break
               }
               catch(err) {
                   if(j == configServices.length -1) {
                       throw err
-                      //reject(err)
                   }
                   else {
-                      console.err('ApolloError: polling失败，' + err.message + ' 开始下一次polling')
+                      console.error('ApolloError: polling失败, 由于有多个configService, 开始下一次lpolling')
                       continue
                   }
               }
@@ -222,14 +254,11 @@ async function submitPolling(notificationMessages){
           }
         }
         catch(e) {
-            console.log(e)
             reject(e)
             break   
         }
-      
     }
   })
-  
 }
 
 //不是longPoll submit的
@@ -254,14 +283,13 @@ async function selfPolling(){
 
                 url = url + "&messages=" + querystring.escape(JSON.stringify(remoteNotificationMessages[namespace]))
             }
-
             if(apolloConfigs[namespace] != undefined) {
                 url = url + "&releaseKey=" + apolloConfigs[namespace].releaseKey
             }
-
+            console.log('sync polling, url: ' + url)
 
             try {
-                newApolloConfig = await doPollingRequest(namespace, url).catch(err => {console.log(err.message); throw err})
+                newApolloConfig = await doPollingRequest(namespace, url).catch(err => {throw err})
                 break
             }
             catch(err) {
@@ -270,7 +298,7 @@ async function selfPolling(){
                     //reject(err)
                 }
                 else {
-                    console.err('ApolloError: polling失败，' + err.message + ' 开始下一次polling')
+                    console.error('ApolloError: polling失败，由于有多个configService,开始下一次polling')
                     continue
                 }
             }
@@ -284,19 +312,15 @@ async function selfPolling(){
         }
       }
       catch(e) {
-          console.log(e)
           reject(e)
           break   
       }
     }
   })
-  
 }
 
 //因为不仅仅是默认的application命名空间，所以要初始化notifications
 function initNotifications() {
-
-
     for(var i =0; i < namespaces.length; i++) {
       var notification = {}
       notification['namespaceName'] = namespaces[i]
@@ -308,88 +332,55 @@ function initNotifications() {
 
 //初始化
 async function init() {
-    configServices = await getConfigServices().catch(error => console.log(error.message))
-    initNotifications()
-    
+    configServices = await getConfigServices().catch(error => {
+      console.error('启动连接apolloServer失败, url: ' + error.url + ' cause(' + error.cause + ')')
+    })
+
     if(configServices != undefined && configServices.length > 0) {
-        
-        
-        let newApolloConfigs = await selfPolling().catch(error => console.log(error.message))
+        initNotifications()
+        let newApolloConfigs = await selfPolling().catch(error => {
+            console.error('第一次拉失败，cause(' + error.cause + ')')
+        })
         if(newApolloConfigs != undefined && Object.keys(newApolloConfigs).length > 0) {
             apolloConfigs = newApolloConfigs
-
-            console.log('第一次短连接，本地apolloConfigs缓存刷新')
+            
+            for(namespace in newApolloConfigs) {
+                apolloConfigs[namespace] = newApolloConfigs[namespace]
+                console.log('namespace: ' + namespace + '，configurations: ' + JSON.stringify(apolloConfigs[namespace].configurations))
+            }
+            console.log('第一次拉成功，本地apolloConfigs缓存刷新')
         }
-
-
-        
+        else {
+            console.error('连接失败了，记录错误！！！！！，使用本地文件！！！！')
+        }
         //短连接循环，保证最终一致性
         setInterval(async ()=> {
-            let newApolloConfigs = await selfPolling().catch(error => console.log(error.message))
+            let newApolloConfigs = await selfPolling().catch(error => {
+                console.error('sync polling failed, will retry appId: ' + appId + ' url: '+ error.url + ' cause(' + error.cause + ')')
+            })
             if(newApolloConfigs != undefined && Object.keys(newApolloConfigs).length > 0) {
               //object的 key
               for(namespace in newApolloConfigs) {
                   apolloConfigs[namespace] = newApolloConfigs[namespace]
-                  console.log('短连接，namespace: ' + namespace + '，本地apolloConfigs缓存刷新')
+                  console.log('namespace: ' + namespace + '，configurations: ' + JSON.stringify(apolloConfigs[namespace].configurations))
               }
             }
-        }, 1000 * 7)
+        }, 1000 * syncInterval)
 
         //长连接循环
-        for(;;){
-            let notificationMessages = await longPolling()
-            if(notificationMessages != undefined && Object.keys(notificationMessages).length > 0) {
-              console.log('长连接变动，触发短连接')
-              let newApolloConfigs = await submitPolling(notificationMessages).catch(error => console.log(error.message))
-              if(newApolloConfigs != undefined && Object.keys(newApolloConfigs).length != 0) {
-                
-                for(namespace in newApolloConfigs) {
-                  apolloConfigs[namespace] = newApolloConfigs[namespace]
-                  console.log('短连接，namespace: ' + namespace + '，本地apolloConfigs缓存刷新')
-                }
-                console.log('长连接，引起本地apolloConfig缓存刷新')
-              }
-            }
-            else {
-              console.log('长连接，没有数据变更')
-            }
-        } 
+        loopLongPolling()
+    }
+    else {
+      console.error('连接失败了，记录错误！！！！！，使用本地文件！！！！')
     }
 }
-
-
-// function test() {
-// return new Promise((resolve, reject) =>{
-//     setInterval(()=> {
-//         console.log('f')
-//         resolve()
-//     }, 5000)
-    
-//   })
-// }
-
-
-// function test(){
-
-//   return new Promise((resolve, reject) =>{
-//       reject(new Error('服务器连接失败'))
-//   })
-// }
-
-// async function aa() {
-//   await test().catch(error => console.log(error.message))
-// }
-
-
-
 
 
  //启动监听3000端口
 app.listen(3000,function(){
     console.log('Example app listening on port 3000!')
+    
     init()
-
-    		// setInterval(periodPolling,10000);
 })
 
 
